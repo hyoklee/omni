@@ -22,13 +22,11 @@ jobs:
             triplet: x64-windows
           - os: windows-2022
             triplet: x64-windows
-          - os: windows-2019
-            triplet: x64-windows
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies via vcpkg
-        run: vcpkg install poco yaml-cpp --triplet ${{ matrix.triplet }}
+        run: vcpkg install poco[crypto,netssl] yaml-cpp --triplet ${{ matrix.triplet }}
 
       - name: Configure
         run: >

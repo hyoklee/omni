@@ -1,0 +1,48 @@
+name: win
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            triplet: arm64-windows
+          - os: windows-2025
+            triplet: x64-windows
+          - os: windows-2022
+            triplet: x64-windows
+          - os: windows-2019
+            triplet: x64-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies via vcpkg
+        run: vcpkg install poco yaml-cpp --triplet ${{ matrix.triplet }}
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}"
+          -DCMAKE_INSTALL_PREFIX="$env:USERPROFILE/omni-install"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Install
+        run: cmake --install build --config Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true

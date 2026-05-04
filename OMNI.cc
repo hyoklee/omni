@@ -1700,8 +1700,8 @@ int OMNI::PutData(const std::string& name, const std::string& tags,
 #endif
 
     // Fallback to SharedMemory (original implementation)
-#ifdef __OpenBSD__
-    // OpenBSD: Poco::SharedMemory is unreliable; write directly to file
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+    // Poco::SharedMemory is unreliable on OpenBSD/NetBSD; write directly to file
     {
       std::ofstream ofs_data(name, std::ios::binary | std::ios::trunc);
       ofs_data.write(reinterpret_cast<const char*>(buffer), nbyte);
@@ -1726,7 +1726,7 @@ int OMNI::PutData(const std::string& name, const std::string& tags,
                 << std::endl;
     }
 #endif
-#endif  // __OpenBSD__
+#endif  // __OpenBSD__ / __NetBSD__
 
   } catch (Poco::Exception& e) {
     std::cerr << "Poco Exception: " << e.displayText() << std::endl;
@@ -3389,8 +3389,8 @@ int OMNI::ReadOmni(const std::string& input_file) {
 #endif
 
         // Fallback to SharedMemory (original implementation)
-#ifdef __OpenBSD__
-        // OpenBSD: Poco::SharedMemory is unreliable; read directly from file
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+        // Poco::SharedMemory is unreliable on OpenBSD/NetBSD; read directly from file
         {
           std::ifstream ifs_data(name, std::ios::binary);
           std::string file_content((std::istreambuf_iterator<char>(ifs_data)),
@@ -3407,7 +3407,7 @@ int OMNI::ReadOmni(const std::string& input_file) {
                     << "' buffer (SharedMemory)." << std::endl;
         }
         WriteS3(dest, shm_r.begin());
-#endif  // __OpenBSD__
+#endif  // __OpenBSD__ / __NetBSD__
 
         // Final WriteS3 call with NULL to finalize
         WriteS3(dest, NULL);

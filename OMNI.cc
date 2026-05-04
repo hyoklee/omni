@@ -186,13 +186,15 @@ static std::string hmac_sha256_hex_impl(const std::string& key,
 #include <openssl/evp.h>
 
 static std::string sha256_hex_impl(const std::string& data) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256_CTX ctx;
-  SHA256_Init(&ctx);
-  SHA256_Update(&ctx, data.data(), data.size());
-  SHA256_Final(hash, &ctx);
+  unsigned char hash[EVP_MAX_MD_SIZE];
+  unsigned int hash_len = 0;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+  EVP_DigestUpdate(ctx, data.data(), data.size());
+  EVP_DigestFinal_ex(ctx, hash, &hash_len);
+  EVP_MD_CTX_free(ctx);
   std::ostringstream ss;
-  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+  for (unsigned int i = 0; i < hash_len; i++)
     ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(hash[i]);
   return ss.str();
 }
@@ -343,15 +345,17 @@ std::string OMNI::Sha256File(const std::string& file_path) {
   std::ifstream fis(file_path, std::ios::binary);
   if (!fis.is_open())
     throw std::runtime_error("Error: cannot open file: " + file_path);
-  SHA256_CTX ctx;
-  SHA256_Init(&ctx);
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
   char buffer[8192];
   while (fis.read(buffer, sizeof(buffer)) || fis.gcount() > 0)
-    SHA256_Update(&ctx, buffer, static_cast<unsigned>(fis.gcount()));
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256_Final(hash, &ctx);
+    EVP_DigestUpdate(ctx, buffer, static_cast<size_t>(fis.gcount()));
+  unsigned char hash[EVP_MAX_MD_SIZE];
+  unsigned int hash_len = 0;
+  EVP_DigestFinal_ex(ctx, hash, &hash_len);
+  EVP_MD_CTX_free(ctx);
   std::stringstream ss;
-  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+  for (unsigned int i = 0; i < hash_len; i++)
     ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(hash[i]);
   return ss.str();
 #else
@@ -1598,6 +1602,43 @@ int OMNI::PutData(const std::string& name, const std::string& tags,
   const std::size_t shared_memory_size = nbyte + 1;
 
   try {
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+    // Use fs:: (std::filesystem) to avoid Poco::File issues on OpenBSD/NetBSD
+    {
+      std::error_code ec;
+      bool file_exists = fs::exists(name, ec);
+      std::uintmax_t file_sz = file_exists ? fs::file_size(name, ec) : 0;
+      if (!quiet_) {
+        std::cout << "checking existing buffer '" << name << "'...";
+      }
+      if (file_exists && file_sz == shared_memory_size) {
+        if (!quiet_) {
+          std::cout << "yes" << std::endl;
+        }
+        return WriteMeta(name, tags);
+      }
+      if (file_exists) {
+        fs::remove(name, ec);
+      }
+      if (!quiet_) {
+        std::cout << "no" << std::endl;
+      }
+      if (!quiet_) {
+        std::cout << "creating a new buffer '" << name << "' with '" << tags
+                  << "' tags...";
+      }
+      std::ofstream ofs_data(name, std::ios::binary | std::ios::trunc);
+      if (!ofs_data.is_open())
+        throw std::runtime_error("Error: cannot create buffer: " + name);
+      ofs_data.write(reinterpret_cast<const char*>(buffer), nbyte);
+      char null_byte = '\0';
+      ofs_data.write(&null_byte, 1);
+      ofs_data.close();
+      if (!quiet_) {
+        std::cout << "done (direct file)" << std::endl;
+      }
+    }
+#else
     Poco::File file(name);
     if (!quiet_) {
       std::cout << "checking existing buffer '" << name << "'...";
@@ -1671,7 +1712,7 @@ int OMNI::PutData(const std::string& name, const std::string& tags,
       Poco::Redis::Client redis_client("localhost", 6379);
       Poco::Redis::Command set_cmd("SET");
       set_cmd << name << std::string((const char*)buffer, nbyte);
-      
+
       std::string result = redis_client.execute<std::string>(set_cmd);
       if (result == "OK") {
         if (!quiet_) {
@@ -1700,19 +1741,6 @@ int OMNI::PutData(const std::string& name, const std::string& tags,
 #endif
 
     // Fallback to SharedMemory (original implementation)
-#if defined(__OpenBSD__) || defined(__NetBSD__)
-    // Poco::SharedMemory is unreliable on OpenBSD/NetBSD; write directly to file
-    {
-      std::ofstream ofs_data(name, std::ios::binary | std::ios::trunc);
-      ofs_data.write(reinterpret_cast<const char*>(buffer), nbyte);
-      char null_byte = '\0';
-      ofs_data.write(&null_byte, 1);
-      ofs_data.close();
-      if (!quiet_) {
-        std::cout << "done (direct file)" << std::endl;
-      }
-    }
-#else
     Poco::SharedMemory shm(file, Poco::SharedMemory::AM_WRITE);
 
     char* data = static_cast<char*>(shm.begin());

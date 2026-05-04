@@ -3,7 +3,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(yaml-cpp)
 
-if(NOT CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "OpenBSD|NetBSD")
   find_dependency(Poco REQUIRED COMPONENTS Crypto Foundation Net NetSSL)
 endif()
 

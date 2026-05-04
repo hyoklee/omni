@@ -2779,8 +2779,8 @@ int OMNI::Download(const std::string& url, const std::string& output_file_name,
           status == Poco::Net::HTTPResponse::HTTP_FOUND ||
           status == Poco::Net::HTTPResponse::HTTP_SEE_OTHER ||
           status == Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT ||
-#ifdef __OpenBSD__
-          status == 308 /* HTTP_PERMANENT_REDIRECT - not in POCO 1.4.x */) {
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+          status == 308 /* HTTP_PERMANENT_REDIRECT - not in old pkgsrc Poco */) {
 #else
           status == Poco::Net::HTTPResponse::HTTP_PERMANENT_REDIRECT) {
 #endif

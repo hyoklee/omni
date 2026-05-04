@@ -112,7 +112,7 @@ typedef SSIZE_T ssize_t;
 #include "Poco/Pipe.h"
 #include "Poco/PipeStream.h"
 #include "Poco/Process.h"
-#ifndef __OpenBSD__
+#if !defined(__OpenBSD__) && !defined(__NetBSD__)
 #include "Poco/SHA2Engine.h"
 #include "Poco/HMACEngine.h"
 #endif
@@ -124,7 +124,7 @@ typedef SSIZE_T ssize_t;
 
 // Compatibility wrapper for older POCO versions that don't have SHA2Engine256
 // SHA2Engine256 was added in POCO 1.12.0 (0x010C0000)
-#ifndef __OpenBSD__
+#if !defined(__OpenBSD__) && !defined(__NetBSD__)
 #include "Poco/Version.h"
 #if POCO_VERSION < 0x010C0000
 namespace Poco {
@@ -179,8 +179,44 @@ static std::string hmac_sha256_hex_impl(const std::string& key,
     ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
   return ss.str();
 }
+#elif defined(__NetBSD__)
+// NetBSD: pkgsrc poco-1.6.1 lacks SHA2Engine; use base system OpenSSL
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+
+static std::string sha256_hex_impl(const std::string& data) {
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  SHA256_CTX ctx;
+  SHA256_Init(&ctx);
+  SHA256_Update(&ctx, data.data(), data.size());
+  SHA256_Final(hash, &ctx);
+  std::ostringstream ss;
+  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(hash[i]);
+  return ss.str();
+}
+
+static std::vector<unsigned char> hmac_sha256_raw_impl(const std::string& key,
+                                                        const std::string& data) {
+  unsigned char result[EVP_MAX_MD_SIZE];
+  unsigned int result_len = 0;
+  HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+       reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+       result, &result_len);
+  return std::vector<unsigned char>(result, result + result_len);
+}
+
+static std::string hmac_sha256_hex_impl(const std::string& key,
+                                         const std::string& data) {
+  auto raw = hmac_sha256_raw_impl(key, data);
+  std::ostringstream ss;
+  for (unsigned char b : raw)
+    ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
+  return ss.str();
+}
 #else
-// Non-OpenBSD: use Poco SHA2Engine256 and HMACEngine
+// Other platforms: use Poco SHA2Engine256 and HMACEngine
 static std::string sha256_hex_impl(const std::string& data) {
   Poco::SHA2Engine256 engine;
   engine.update(data);
@@ -200,7 +236,7 @@ static std::string hmac_sha256_hex_impl(const std::string& key,
   hmac.update(data);
   return Poco::DigestEngine::digestToHex(hmac.digest());
 }
-#endif  // __OpenBSD__
+#endif  // __OpenBSD__ / __NetBSD__
 
 #ifdef USE_REDIS
 #include "Poco/Redis/Client.h"
@@ -303,6 +339,21 @@ std::string OMNI::Sha256File(const std::string& file_path) {
     throw std::runtime_error("Error: calculating SHA256 of file: " + file_path);
   }
   return std::string(result);
+#elif defined(__NetBSD__)
+  std::ifstream fis(file_path, std::ios::binary);
+  if (!fis.is_open())
+    throw std::runtime_error("Error: cannot open file: " + file_path);
+  SHA256_CTX ctx;
+  SHA256_Init(&ctx);
+  char buffer[8192];
+  while (fis.read(buffer, sizeof(buffer)) || fis.gcount() > 0)
+    SHA256_Update(&ctx, buffer, static_cast<unsigned>(fis.gcount()));
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  SHA256_Final(hash, &ctx);
+  std::stringstream ss;
+  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(hash[i]);
+  return ss.str();
 #else
   try {
     Poco::FileInputStream fis(file_path);

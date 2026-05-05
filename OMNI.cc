@@ -2826,7 +2826,7 @@ int OMNI::ReadHF(const std::string& src, const std::string& local_dst) {
           status == Poco::Net::HTTPResponse::HTTP_FOUND ||
           status == Poco::Net::HTTPResponse::HTTP_SEE_OTHER ||
           status == Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT ||
-#ifdef __OpenBSD__
+#if defined(__OpenBSD__) || defined(__NetBSD__)
           status == 308) {
 #else
           status == Poco::Net::HTTPResponse::HTTP_PERMANENT_REDIRECT) {

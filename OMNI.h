@@ -96,6 +96,9 @@ class OMNI {
               const std::string& path, unsigned char* buffer, size_t nbyte);
   int WriteS3(const std::string& dest, char* ptr);
   int ReadS3(const std::string& src, const std::string& local_file);
+  std::string ReadHFToken();
+  int ReadHF(const std::string& src, const std::string& local_dst);
+  int WriteHF(const std::string& dest, const std::string& local_src);
 
   // Download/transfer functions
   int Download(const std::string& url, const std::string& output_file_name,

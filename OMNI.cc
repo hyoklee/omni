@@ -117,6 +117,7 @@ typedef SSIZE_T ssize_t;
 #include "Poco/HMACEngine.h"
 #endif
 #include "Poco/SharedMemory.h"
+#include "Poco/Base64Encoder.h"
 #include "Poco/StreamCopier.h"
 #include "Poco/TemporaryFile.h"
 #include "Poco/URI.h"
@@ -2699,6 +2700,282 @@ int OMNI::ReadS3(const std::string& src, const std::string& local_file) {
 }
 #endif
 
+// ── HuggingFace helpers ──────────────────────────────────────────────────────
+
+std::string OMNI::ReadHFToken() {
+  // 1. HF_TOKEN env var
+  const char* tok = std::getenv("HF_TOKEN");
+  if (tok && tok[0]) return tok;
+
+  // 2. HUGGING_FACE_HUB_TOKEN env var
+  tok = std::getenv("HUGGING_FACE_HUB_TOKEN");
+  if (tok && tok[0]) return tok;
+
+  // 3. ~/.huggingface/token
+  std::string home_dir;
+#ifdef _WIN32
+  char* home_path = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&home_path, &len, "USERPROFILE") == 0 && home_path) {
+    home_dir = home_path;
+    free(home_path);
+  }
+#else
+  const char* home_env = std::getenv("HOME");
+  if (home_env == nullptr) {
+    struct passwd* pw = getpwuid(getuid());
+    if (pw) home_dir = pw->pw_dir;
+  } else {
+    home_dir = home_env;
+  }
+#endif
+  if (!home_dir.empty()) {
+    std::ifstream tf(home_dir + "/.huggingface/token");
+    if (tf.is_open()) {
+      std::string token;
+      std::getline(tf, token);
+      token.erase(token.find_last_not_of(" \t\n\r") + 1);
+      if (!token.empty()) return token;
+    }
+  }
+
+  // 4. ~/.wrp/config key HuggingFaceToken
+  return ReadConfigValue("HuggingFaceToken");
+}
+
+// Parse hf://<type>/<owner>/<repo>/<path_in_repo>
+// Returns false on failure; fills type, owner, repo, file_path.
+static bool ParseHFUrl(const std::string& url,
+                       std::string& type,
+                       std::string& owner,
+                       std::string& repo,
+                       std::string& file_path) {
+  const std::string prefix = "hf://";
+  if (url.find(prefix) != 0) return false;
+  std::string rem = url.substr(prefix.size());
+
+  auto split = [&](std::string& out, std::string& rest) -> bool {
+    size_t pos = rest.find('/');
+    if (pos == std::string::npos) return false;
+    out = rest.substr(0, pos);
+    rest = rest.substr(pos + 1);
+    return true;
+  };
+
+  if (!split(type, rem)) return false;
+  if (!split(owner, rem)) return false;
+  if (!split(repo, rem)) return false;
+  file_path = rem;
+  return !file_path.empty();
+}
+
+int OMNI::ReadHF(const std::string& src, const std::string& local_dst) {
+  std::string type, owner, repo, file_path;
+  if (!ParseHFUrl(src, type, owner, repo, file_path)) {
+    std::cerr << "Error: invalid hf:// URL: " << src << std::endl;
+    return -1;
+  }
+
+  std::string token = ReadHFToken();
+
+  // Build HTTPS download URL:
+  // https://huggingface.co/<type>/<owner>/<repo>/resolve/main/<path>
+  std::string https_url = "https://huggingface.co/" + type + "/" + owner +
+                          "/" + repo + "/resolve/main/" + file_path;
+  if (!quiet_) {
+    std::cout << "HuggingFace GET: " << https_url << std::endl;
+  }
+
+  try {
+#ifdef __OpenBSD__
+    Poco::Net::Context::Ptr context = new Poco::Net::Context(
+        Poco::Net::Context::CLIENT_USE, "", "", "/etc/ssl/cert.pem",
+        Poco::Net::Context::VERIFY_NONE, 9, false);
+    SSL_CTX_set_min_proto_version(context->sslContext(), TLS1_2_VERSION);
+#else
+    Poco::Net::Context::Ptr context = new Poco::Net::Context(
+        Poco::Net::Context::CLIENT_USE, "", "", "",
+        Poco::Net::Context::VERIFY_NONE, 9, true, "../cacert.pem");
+#endif
+
+    std::string current_url = https_url;
+    const int max_redirects = 10;
+    for (int redirects = 0; redirects <= max_redirects; ++redirects) {
+      Poco::URI uri(current_url);
+      std::unique_ptr<Poco::Net::HTTPClientSession> session;
+      if (uri.getScheme() == "https") {
+        session = std::make_unique<Poco::Net::HTTPSClientSession>(
+            uri.getHost(), uri.getPort() == 0 ? 443 : uri.getPort(), context);
+      } else {
+        session = std::make_unique<Poco::Net::HTTPClientSession>(
+            uri.getHost(), uri.getPort() == 0 ? 80 : uri.getPort());
+      }
+
+      Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
+                                 uri.getPathAndQuery(),
+                                 Poco::Net::HTTPMessage::HTTP_1_1);
+      req.set("User-Agent", "wrp/1.0");
+      if (!token.empty()) req.set("Authorization", "Bearer " + token);
+
+      session->sendRequest(req);
+      Poco::Net::HTTPResponse resp;
+      std::istream& rs = session->receiveResponse(resp);
+      int status = resp.getStatus();
+
+      if (status == Poco::Net::HTTPResponse::HTTP_MOVED_PERMANENTLY ||
+          status == Poco::Net::HTTPResponse::HTTP_FOUND ||
+          status == Poco::Net::HTTPResponse::HTTP_SEE_OTHER ||
+          status == Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT ||
+#ifdef __OpenBSD__
+          status == 308) {
+#else
+          status == Poco::Net::HTTPResponse::HTTP_PERMANENT_REDIRECT) {
+#endif
+        if (!resp.has("Location")) {
+          std::cerr << "Error: redirect without Location header" << std::endl;
+          return -1;
+        }
+        {
+          Poco::URI base_uri(current_url);
+          base_uri.resolve(resp.get("Location"));
+          current_url = base_uri.toString();
+        }
+        if (!quiet_) std::cout << "Redirected to: " << current_url << std::endl;
+        Poco::NullOutputStream null_out;
+        Poco::StreamCopier::copyStream(rs, null_out);
+        continue;
+      }
+
+      if (status == Poco::Net::HTTPResponse::HTTP_OK) {
+        std::ofstream out(local_dst, std::ios::binary);
+        if (!out.is_open()) {
+          std::cerr << "Error: cannot open output file: " << local_dst << std::endl;
+          return -1;
+        }
+        Poco::StreamCopier::copyStream(rs, out);
+        out.close();
+        if (!quiet_) {
+          std::cout << "Downloaded " << src << " -> " << local_dst << std::endl;
+        }
+        return 0;
+      }
+
+      std::string err_body;
+      Poco::StreamCopier::copyToString(rs, err_body);
+      std::cerr << "Error: HuggingFace GET failed with status " << status
+                << ": " << err_body << std::endl;
+      return -1;
+    }
+    std::cerr << "Error: too many redirects for " << src << std::endl;
+  } catch (const Poco::Exception& ex) {
+    std::cerr << "Error: " << ex.displayText() << std::endl;
+  }
+  return -1;
+}
+
+int OMNI::WriteHF(const std::string& dest, const std::string& local_src) {
+  std::string type, owner, repo, file_path;
+  if (!ParseHFUrl(dest, type, owner, repo, file_path)) {
+    std::cerr << "Error: invalid hf:// URL: " << dest << std::endl;
+    return -1;
+  }
+
+  std::string token = ReadHFToken();
+  if (token.empty()) {
+    std::cerr << "Error: HuggingFace token not found. "
+                 "Set HF_TOKEN env var or store in ~/.huggingface/token"
+              << std::endl;
+    return -1;
+  }
+
+  // Read local file
+  std::ifstream f(local_src, std::ios::binary);
+  if (!f.is_open()) {
+    std::cerr << "Error: cannot open file for upload: " << local_src << std::endl;
+    return -1;
+  }
+  std::string file_content((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+  f.close();
+
+  if (!quiet_) {
+    std::cout << "HuggingFace PUT: " << local_src << " -> " << dest << std::endl;
+  }
+
+  // Build application/x-ndjson body for HuggingFace Hub commit API:
+  // POST /api/<type>/<owner>/<repo>/commit/main
+  // Line 1: header with summary
+  // Line 2: file entry with base64-encoded content
+
+  // Base64-encode the file content
+  std::ostringstream b64_out;
+  Poco::Base64Encoder encoder(b64_out);
+  encoder.rdbuf()->setLineLength(0);  // no line breaks
+  encoder.write(file_content.data(), static_cast<std::streamsize>(file_content.size()));
+  encoder.close();
+  std::string b64_content = b64_out.str();
+
+  std::string body;
+  body += "{\"key\":\"header\",\"value\":{\"summary\":\"Upload via wrp\",\"description\":\"\"}}\n";
+  body += "{\"key\":\"file\",\"value\":{\"path\":\"" + file_path +
+          "\",\"encoding\":\"base64\",\"content\":\"" + b64_content + "\"}}\n";
+
+  std::string api_path = "/api/" + type + "/" + owner + "/" + repo + "/commit/main";
+
+  try {
+#ifdef __OpenBSD__
+    Poco::Net::Context::Ptr context = new Poco::Net::Context(
+        Poco::Net::Context::CLIENT_USE, "", "", "/etc/ssl/cert.pem",
+        Poco::Net::Context::VERIFY_NONE, 9, false);
+    SSL_CTX_set_min_proto_version(context->sslContext(), TLS1_2_VERSION);
+#else
+    Poco::Net::Context::Ptr context = new Poco::Net::Context(
+        Poco::Net::Context::CLIENT_USE, "", "", "",
+        Poco::Net::Context::VERIFY_NONE, 9, true, "../cacert.pem");
+#endif
+
+    Poco::Net::HTTPSClientSession session("huggingface.co", 443, context);
+
+    Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST,
+                               api_path,
+                               Poco::Net::HTTPMessage::HTTP_1_1);
+    req.set("Authorization", "Bearer " + token);
+    req.set("User-Agent", "wrp/1.0");
+    req.setContentType("application/x-ndjson");
+    req.setContentLength(static_cast<std::streamsize>(body.size()));
+
+    if (!quiet_) {
+      std::cout << "POST " << api_path << " to huggingface.co" << std::endl;
+    }
+
+    std::ostream& os = session.sendRequest(req);
+    os.write(body.data(), static_cast<std::streamsize>(body.size()));
+
+    Poco::Net::HTTPResponse resp;
+    std::istream& rs = session.receiveResponse(resp);
+    int status = resp.getStatus();
+
+    std::string resp_body;
+    Poco::StreamCopier::copyToString(rs, resp_body);
+
+    if (status == Poco::Net::HTTPResponse::HTTP_OK ||
+        status == Poco::Net::HTTPResponse::HTTP_CREATED) {
+      if (!quiet_) {
+        std::cout << "Successfully uploaded to " << dest << std::endl;
+      }
+      return 0;
+    }
+    std::cerr << "Error: HuggingFace upload failed with status " << status
+              << ": " << resp_body << std::endl;
+    return -1;
+  } catch (const Poco::Exception& ex) {
+    std::cerr << "Error: " << ex.displayText() << std::endl;
+    return -1;
+  }
+}
+
+// ── End HuggingFace helpers ──────────────────────────────────────────────────
+
 int OMNI::Download(const std::string& url, const std::string& output_file_name,
                    long long start_byte, long long end_byte) {
   // Call the overloaded version with proxy config
@@ -2953,6 +3230,7 @@ int OMNI::ReadOmni(const std::string& input_file) {
 #endif
           if (path.find("https://") == path.npos &&
               path.find("hdf5://") == path.npos &&
+              path.find("hf://") == path.npos &&
               path.find("s3://") == path.npos
 #ifdef USE_GLOBUS
               && path.find("globus://") == path.npos
@@ -3283,6 +3561,12 @@ int OMNI::ReadOmni(const std::string& input_file) {
       std::cerr << "Error: downloading from S3 '" << path << "' failed" << std::endl;
   }
 
+  if (!path.empty() && path.find("hf://") == 0) {
+    std::string local_out = dest.empty() ? name : dest;
+    if (ReadHF(path, local_out) != 0)
+      std::cerr << "Error: downloading from HuggingFace '" << path << "' failed" << std::endl;
+  }
+
   if (!hash.empty()) {
     std::string h;
     if (!path.empty() && path.find("https://") != 0 &&
@@ -3314,10 +3598,14 @@ int OMNI::ReadOmni(const std::string& input_file) {
 
         // After script execution, process dst
         if (res == 0) {
-          // Check if destination is an S3 URL
+          // Check if destination is an S3 or HuggingFace URL
           bool is_s3_dest = (dest.find("s3://") == 0);
+          bool is_hf_dest = (dest.find("hf://") == 0);
 
-          if (is_s3_dest) {
+          if (is_hf_dest) {
+            // HuggingFace destination - upload lambda output file
+            WriteHF(dest, GetFileName(dest));
+          } else if (is_s3_dest) {
             // S3 destination - upload the file
             WriteS3(dest, NULL);
           } else {
@@ -3339,6 +3627,18 @@ int OMNI::ReadOmni(const std::string& input_file) {
       } else {
         // Not using run - check dst before processing
         bool is_s3_dest = (dest.find("s3://") == 0);
+        bool is_hf_dest = (dest.find("hf://") == 0);
+
+        if (is_hf_dest) {
+          // HuggingFace destination - upload the local source file
+          res = WriteHF(dest, path);
+          if (res != 0) {
+            std::cerr << "Error: HuggingFace upload to '" << dest << "' failed"
+                      << std::endl;
+            return res;
+          }
+          return 0;
+        }
 
         // If not S3, check if the destination file exists
         if (!is_s3_dest) {
